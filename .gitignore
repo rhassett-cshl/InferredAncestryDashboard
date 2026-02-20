@@ -1,0 +1,6 @@
+/.cursor
+/.vscode
+.RData
+.Rhistory
+ancestryinference*.db
+run_shiny.R

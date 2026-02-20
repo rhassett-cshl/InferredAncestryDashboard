@@ -1,0 +1,41 @@
+---
+title: "Inferred Ancestry Dashboard"
+date: "Feb 20 2026"
+---
+
+## Introduction
+This application is designed to interactively visualize...  
+Source code and additional information for this application are available via the [Inferred Ancestry Dashboard GitHub repository](https://github.com)  
+<br>
+
+## Application usage
+The application has two main inputs: a map and a table. To build plots for any individual sample, click on your desired sample in either the map or the table.  
+
+The map and table inputs are responsive to eachother. When you click a site on the map, the table will automatically filter to samples associated with that site.
+When you click on a row in the table, the map will automatically fly to that site location.  
+<br>
+<br>
+
+## Package dependencies & credits
+This application depends on functions contained within the [RAIDS R-package](https://krasnitzlab.github.io/RAIDS/articles/RAIDS.html).
+Special thanks to R packages leaflet, leaflet.extras, and Shiny.  
+
+### Package dependencies:  
+```
+	DBI,
+	dplyr,
+	DT,
+	htmltools,
+	leaflet,
+	magrittr,
+	pool,
+	RSQLite,
+	shiny,
+	shinycssloaders
+```
+
+## Help & feedback
+For additional help or to submit feedback or bug reports, please contact:  
+Rebecca Hassett 
+Cold Spring Harbor Lab
+hassett@cshl.edu
