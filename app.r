@@ -40,7 +40,30 @@ ui <- fluidPage(
       )
     ),
     tabPanel(
-      "Plots"
+      "Plots",
+      column(
+        12,
+        h4("Population-specific accuracy for selected ancestry call"),
+        p("Select one or more rows in the Table tab."),
+        plotOutput("pop_specific_accuracy_plot", height = "66vh"),
+        fluidRow(
+          column(
+            12,
+            div(
+              style = paste(
+                "display:flex;",
+                "gap:10px;",
+                "align-items:center;",
+                "justify-content:center;",
+                "margin-top:8px;"
+              ),
+              actionButton("plot_prev", "\u2190 Previous"),
+              strong(textOutput("plot_nav_status", inline = TRUE)),
+              actionButton("plot_next", "Next \u2192")
+            )
+          )
+        )
+      )
     ),
     tabPanel(
       "User guide",
@@ -80,7 +103,9 @@ server <- function(input, output, session){
     bioSample = "BioSample",
     bioProject = "BioProject",
     libraryStrategy = "Library Strategy",
-    populationDefinition_name = "Population Definition",
+    tissueType = "Tissue Type",
+    name_populationDefinition = "Population Definition",
+    name_populationResolution = "Population Resolution",
     accuracy = "Accuracy",
     accuracyQuantifier = "Accuracy Quantifier",
     inferenceMethodProperties_name = "Inference Method",
@@ -110,22 +135,11 @@ server <- function(input, output, session){
     }
     if (diff(lng_r) == 0) lng_r <- lng_r + c(-0.5, 0.5)
     if (diff(lat_r) == 0) lat_r <- lat_r + c(-0.5, 0.5)
-    # Slight margin so fitBounds has room; restrict panning to avoid gray
-    margin <- 0.15 * max(diff(lng_r), diff(lat_r), 1)
-    bounds <- list(
-      c(lat_r[1] - margin, lng_r[1] - margin),
-      c(lat_r[2] + margin, lng_r[2] + margin)
-    )
-    m_base <- leaflet::leaflet(options =
-      leaflet::leafletOptions(
-        maxBounds = bounds,
-        maxBoundsViscosity = 1
-      )
-    ) %>%
+    m_base <- leaflet::leaflet() %>%
       leaflet::addTiles(options = leaflet::tileOptions(noWrap = TRUE))
     lng_range <- lng_r
     lat_range <- lat_r
-    m_base %>%
+    out <- m_base %>%
       leaflet::addCircleMarkers(
         lng = m$lng,
         lat = m$lat,
@@ -135,7 +149,23 @@ server <- function(input, output, session){
         stroke = FALSE,
         color = "#2C7BB6",
         label = m$label
-      ) %>%
+      )
+    if (length(m$clusters$lng) > 0) {
+      out <- out %>%
+        leaflet::addCircleMarkers(
+          lng = m$clusters$lng,
+          lat = m$clusters$lat,
+          layerId = paste0("cluster_", seq_along(m$clusters$lng)),
+          radius = 10,
+          fillOpacity = 0.9,
+          stroke = TRUE,
+          weight = 2,
+          color = "#333333",
+          fillColor = "#E67E22",
+          popup = m$clusters$popup
+        )
+    }
+    out %>%
       leaflet::fitBounds(
         lng1 = lng_range[1],
         lat1 = lat_range[1],
@@ -170,12 +200,20 @@ server <- function(input, output, session){
     }
   }
 
-  # Turn Experiment values into SRA links while displaying same text
-  if ("Experiment" %in% names(ancestryCall)){
+  # Show Experiment as SRA link only when source database contains "SRA"
+  if ("Experiment" %in% names(ancestryCall)) {
+    db_col <- if ("database" %in% names(ancestryCall)) "database" else NULL
     ancestryCall$Experiment <- vapply(
-      as.character(ancestryCall$Experiment),
-      function(val){
-        if (is.na(val) || nzchar(val) == FALSE) return("")
+      seq_len(nrow(ancestryCall)),
+      function(i) {
+        val <- as.character(ancestryCall$Experiment[i])
+        if (is.na(val) || !nzchar(trimws(val))) return("")
+        is_sra <- FALSE
+        if (!is.null(db_col)) {
+          db_val <- as.character(ancestryCall[[db_col]][i])
+          is_sra <- !is.na(db_val) && grepl("SRA", db_val, ignore.case = TRUE)
+        }
+        if (!is_sra) return(val)
         url <- paste0(
           "https://www.ncbi.nlm.nih.gov/sra/?term=",
           utils::URLencode(val, reserved = TRUE)
@@ -189,21 +227,31 @@ server <- function(input, output, session){
     )
   }
 
-  # Table interface
+  # Table interface (exclude lat/long and database from display)
+  table_cols <- setdiff(
+    names(ancestryCall),
+    c("ancestryCallId", "latitude", "longitude", "database")
+  )
   output$table_input=DT::renderDataTable({
+    tbl <- ancestryCall[, table_cols, drop = FALSE]
+    # Force all columns to character so DT uses text filter (searchable) in each
+    for (col in names(tbl)) {
+      if (col != "Experiment")
+        tbl[[col]] <- as.character(tbl[[col]])
+    }
     # Do not escape the Experiment column so links render; escape others
-    escape_cols <- seq_len(ncol(ancestryCall))
-    exp_idx <- which(names(ancestryCall) == "Experiment")
+    escape_cols <- seq_len(ncol(tbl))
+    exp_idx <- which(names(tbl) == "Experiment")
     if (length(exp_idx) == 1){
       escape_cols <- setdiff(escape_cols, exp_idx)
     }
 
     DT::datatable(
-      ancestryCall,
+      tbl,
       escape = escape_cols,
       selection = "multiple",
       rownames = FALSE,
-      filter="top",
+      filter = list(position = "top", clear = FALSE),
       options = list(
         dom = "ltipr",
         scrollX = TRUE,
@@ -211,9 +259,34 @@ server <- function(input, output, session){
         paging = FALSE,
         searching = TRUE,
         orderCellsTop = TRUE,
+        search = list(regex = FALSE, caseInsensitive = TRUE),
         columnDefs = list(
           list(targets = "_all", className = "dt-left"),
           list(targets = "_all", searchable = TRUE)
+        ),
+        initComplete = htmlwidgets::JS(
+          "function(settings, json) {",
+          "  var api = this.api();",
+          "  var n = api.columns().count();",
+          "  var $container = $(api.table().container());",
+          "  var $filterRow = $container.find('thead tr').filter(function() {",
+          "    return $(this).find('td').length > 0;",
+          "  }).first();",
+          "  if ($filterRow.length === 0) $filterRow = $container.find('thead tr').eq(1);",
+          "  $filterRow.find('td').each(function(i) {",
+          "    if (i >= n) return;",
+          "    var $cell = $(this);",
+          "    var oldVal = $cell.find('input').val() || $cell.find('select').val() || '';",
+          "    $cell.empty();",
+          "    var $input = $('<input type=\"text\" placeholder=\"Search\">');",
+          "    $input.val(oldVal);",
+          "    $input.css('width', '100%');",
+          "    $cell.append($input);",
+          "    $input.on('keyup change', function() {",
+          "      api.column(i).search(this.value).draw();",
+          "    });",
+          "  });",
+          "}"
         )
       )
     )
@@ -236,13 +309,15 @@ server <- function(input, output, session){
     ac[keep, , drop = FALSE]
   })
 
-  # Build lng, lat, layerId, label for map markers; label = HTML summary
+  # Build lng, lat, layerId, label for map markers; label = HTML summary.
+  # Clusters (overlapping points) get a center marker with popup (Previous/Next).
   build_ancestry_markers <- function(ac) {
     lat_col <- "latitude"
     lng_col <- "longitude"
     if (!lat_col %in% names(ac) || !lng_col %in% names(ac) || nrow(ac) == 0)
       return(list(lng = numeric(0), lat = numeric(0),
-        layerId = character(0), label = list()))
+        layerId = character(0), label = list(),
+        clusters = list(lng = numeric(0), lat = numeric(0), popup = list())))
     lng_raw <- vapply(ac[[lng_col]], function(x)
       as.numeric(unlist(x))[1], numeric(1))
     lat_raw <- vapply(ac[[lat_col]], function(x)
@@ -251,6 +326,19 @@ server <- function(input, output, session){
     ac <- ac[keep, , drop = FALSE]
     lng_vals <- lng_raw[keep]
     lat_vals <- lat_raw[keep]
+    key <- paste(round(lng_vals, 6), round(lat_vals, 6))
+    grps <- split(seq_along(key), key)
+    # Cluster centers (original coords) for groups with n > 1
+    cluster_centers <- list()
+    for (idx in grps) {
+      n <- length(idx)
+      if (n <= 1) next
+      cluster_centers[[length(cluster_centers) + 1]] <- list(
+        lng = lng_vals[idx[1]],
+        lat = lat_vals[idx[1]],
+        idx = idx
+      )
+    }
     label_col <- if ("Experiment" %in% names(ac)) "Experiment" else
       if ("experiment" %in% names(ac)) "experiment" else NULL
     ids <- if (is.null(label_col)) as.character(seq_len(nrow(ac))) else
@@ -267,7 +355,55 @@ server <- function(input, output, session){
       }, character(1))
       htmltools::HTML(paste(parts, collapse = "<br/>"))
     })
-    list(lng = lng_vals, lat = lat_vals, layerId = ids, label = labels)
+    # Popup HTML for each cluster (Previous/Next to cycle through labels)
+    cluster_lng <- numeric(0)
+    cluster_lat <- numeric(0)
+    cluster_popup <- list()
+    prev_js <- paste0(
+      "var p=this.closest('.cluster-popup');var n=parseInt(p.dataset.n,10);",
+      "var cur=parseInt(p.dataset.cur||0,10);cur=(cur+n-1)%n;p.dataset.cur=cur;",
+      "var items=p.querySelectorAll('.cluster-item');",
+      "for(var i=0;i<items.length;i++)items[i].style.display=(i===cur)?'block':'none';",
+      "p.querySelector('.cluster-num').textContent=cur+1;"
+    )
+    next_js <- paste0(
+      "var p=this.closest('.cluster-popup');var n=parseInt(p.dataset.n,10);",
+      "var cur=parseInt(p.dataset.cur||0,10);cur=(cur+1)%n;p.dataset.cur=cur;",
+      "var items=p.querySelectorAll('.cluster-item');",
+      "for(var i=0;i<items.length;i++)items[i].style.display=(i===cur)?'block':'none';",
+      "p.querySelector('.cluster-num').textContent=cur+1;"
+    )
+    for (cc in cluster_centers) {
+      idx <- cc$idx
+      n <- length(idx)
+      items_html <- character(n)
+      for (j in seq_len(n)) {
+        item_content <- as.character(labels[[idx[j]]])
+        items_html[j] <- paste0(
+          '<div class="cluster-item" style="display:',
+          if (j == 1) "block" else "none", ';">', item_content, "</div>"
+        )
+      }
+      popup_html <- paste0(
+        '<div class="cluster-popup" data-n="', n, '" data-cur="0">',
+        '<p>Sample <span class="cluster-num">1</span> of ',
+        '<span class="cluster-total">', n, '</span></p>',
+        '<div class="cluster-items">', paste(items_html, collapse = ""),
+        '</div><br/><button type="button" onclick="', prev_js,
+        '">Previous</button> <button type="button" onclick="', next_js,
+        '">Next</button></div>'
+      )
+      cluster_lng <- c(cluster_lng, cc$lng)
+      cluster_lat <- c(cluster_lat, cc$lat)
+      cluster_popup <- c(cluster_popup, list(htmltools::HTML(popup_html)))
+    }
+    list(
+      lng = lng_vals,
+      lat = lat_vals,
+      layerId = ids,
+      label = labels,
+      clusters = list(lng = cluster_lng, lat = cluster_lat, popup = cluster_popup)
+    )
   }
 
   # Export Table filtered/sorted data to CSV
@@ -325,6 +461,247 @@ server <- function(input, output, session){
     }
   )
 
+  selected_ancestry_call_ids <- reactive({
+    sel <- input$table_input_rows_selected
+    if (length(sel) < 1) return(integer(0))
+    if (!"ancestryCallId" %in% names(ancestryCall)) return(integer(0))
+    ids <- suppressWarnings(as.integer(ancestryCall$ancestryCallId[sel]))
+    ids <- ids[is.finite(ids)]
+    unique(ids)
+  })
+
+  plot_idx <- reactiveVal(1L)
+
+  observeEvent(input$table_input_rows_selected, {
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) {
+      plot_idx(1L)
+      return()
+    }
+    cur <- isolate(plot_idx())
+    if (!is.finite(cur) || cur < 1L || cur > length(ids)) {
+      plot_idx(1L)
+    }
+  }, ignoreNULL = FALSE)
+
+  observeEvent(input$plot_prev, {
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) return()
+    cur <- isolate(plot_idx())
+    if (!is.finite(cur)) cur <- 1L
+    plot_idx(max(1L, cur - 1L))
+  })
+
+  observeEvent(input$plot_next, {
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) return()
+    cur <- isolate(plot_idx())
+    if (!is.finite(cur)) cur <- 1L
+    plot_idx(min(length(ids), cur + 1L))
+  })
+
+  current_ancestry_call_id <- reactive({
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) return(NULL)
+    idx <- plot_idx()
+    if (!is.finite(idx)) idx <- 1L
+    idx <- max(1L, min(as.integer(idx), length(ids)))
+    ids[idx]
+  })
+
+  output$plot_nav_status <- renderText({
+    ids <- selected_ancestry_call_ids()
+    n <- length(ids)
+    if (!n) return("Sample 0 of 0")
+    idx <- plot_idx()
+    if (!is.finite(idx)) idx <- 1L
+    idx <- max(1L, min(as.integer(idx), n))
+    paste("Sample", idx, "of", n)
+  })
+
+  output$pop_specific_accuracy_plot <- renderPlot({
+    ac_id <- current_ancestry_call_id()
+    if (is.null(ac_id)) {
+      return(
+        ggplot2::ggplot() +
+          ggplot2::theme_void() +
+          ggplot2::annotate(
+            "text",
+            x = 0.5,
+            y = 0.5,
+            label = "No ancestry call selected in the Table tab."
+          )
+      )
+    }
+
+    pop_acc <- getPopSpecificAccuracyForAncestryCall(ac_id)
+    if (!nrow(pop_acc)) {
+      return(
+        ggplot2::ggplot() +
+          ggplot2::theme_void() +
+          ggplot2::annotate(
+            "text",
+            x = 0.5,
+            y = 0.5,
+            label = "No population-specific entries found."
+          )
+      )
+    }
+
+    req("populationDefinition" %in% names(pop_acc))
+    req("accuracy" %in% names(pop_acc))
+
+    pop_acc <- pop_acc %>%
+      dplyr::mutate(
+        series = "Population definition",
+        populationDefinition = as.character(.data$populationDefinition),
+        populationDefinition = dplyr::if_else(
+          is.na(.data$populationDefinition) |
+            !nzchar(trimws(.data$populationDefinition)),
+          "Unknown population",
+          .data$populationDefinition
+        ),
+        accuracy = suppressWarnings(as.numeric(as.character(.data$accuracy))),
+        CILowerBound = suppressWarnings(
+          as.numeric(as.character(.data$CILowerBound))
+        ),
+        CIUpperBound = suppressWarnings(
+          as.numeric(as.character(.data$CIUpperBound))
+        )
+      )
+
+    ac_overall <- getAncestryCallAccuracyForPlot(ac_id)
+    if (nrow(ac_overall) > 0) {
+      bio_sample <- as.character(ac_overall$bioSample[1])
+      if (is.na(bio_sample) || !nzchar(trimws(bio_sample))) {
+        bio_sample <- paste("ancestryCall", ac_id)
+      }
+      ac_row <- data.frame(
+        series = "Selected BioSample",
+        populationDefinition = paste("BioSample:", bio_sample),
+        accuracy = suppressWarnings(
+          as.numeric(as.character(ac_overall$accuracy[1]))
+        ),
+        CILowerBound = suppressWarnings(
+          as.numeric(as.character(ac_overall$CILowerBound[1]))
+        ),
+        CIUpperBound = suppressWarnings(
+          as.numeric(as.character(ac_overall$CIUpperBound[1]))
+        ),
+        stringsAsFactors = FALSE
+      )
+      pop_acc <- dplyr::bind_rows(pop_acc, ac_row)
+    }
+
+    pop_acc <- pop_acc %>%
+      dplyr::mutate(
+        CILowerBound = dplyr::coalesce(.data$CILowerBound, .data$accuracy),
+        CIUpperBound = dplyr::coalesce(.data$CIUpperBound, .data$accuracy)
+      )
+
+    keep <- is.finite(pop_acc$accuracy)
+    pop_acc <- pop_acc[keep, , drop = FALSE]
+
+    if (!nrow(pop_acc)) {
+      return(
+        ggplot2::ggplot() +
+          ggplot2::theme_void() +
+          ggplot2::annotate(
+            "text",
+            x = 0.5,
+            y = 0.5,
+            label = "No numeric accuracy values available."
+          )
+      )
+    }
+
+    y_label <- "Accuracy (%)"
+    pop_acc <- pop_acc %>%
+      dplyr::mutate(
+        accuracy = .data$accuracy * 100,
+        CILowerBound = .data$CILowerBound * 100,
+        CIUpperBound = .data$CIUpperBound * 100
+      )
+
+    pop_acc <- pop_acc %>%
+      dplyr::arrange(.data$accuracy) %>%
+      dplyr::mutate(
+        populationDefinition = factor(
+          .data$populationDefinition,
+          levels = unique(.data$populationDefinition)
+        )
+      )
+
+    ggplot2::ggplot(
+      pop_acc,
+      ggplot2::aes(
+        x = .data$populationDefinition,
+        y = .data$accuracy
+      )
+    ) +
+      ggplot2::geom_errorbar(
+        ggplot2::aes(
+          ymin = .data$CILowerBound,
+          ymax = .data$CIUpperBound,
+          color = .data$series
+        ),
+        width = 0.22,
+        linewidth = 1.0,
+        alpha = 0.85,
+        na.rm = TRUE
+      ) +
+      ggplot2::geom_point(
+        ggplot2::aes(fill = .data$series),
+        size = 3.2,
+        shape = 21,
+        color = "white",
+        stroke = 0.7,
+        na.rm = TRUE
+      ) +
+      ggplot2::scale_fill_manual(
+        values = c(
+          "Population definition" = "#2D7FB8",
+          "Selected BioSample" = "#E87D2A"
+        ),
+        drop = FALSE
+      ) +
+      ggplot2::scale_color_manual(
+        values = c(
+          "Population definition" = "#1B1E23",
+          "Selected BioSample" = "#9A4D12"
+        ),
+        drop = FALSE
+      ) +
+      ggplot2::labs(
+        title = "Accuracy with confidence intervals",
+        subtitle = paste("ancestryCallId:", ac_id),
+        x = "Population definition",
+        y = y_label,
+        fill = NULL,
+        color = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 13) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold"),
+        axis.line.x = ggplot2::element_line(
+          color = "#2D2D2D",
+          linewidth = 0.6
+        ),
+        axis.line.y = ggplot2::element_line(
+          color = "#2D2D2D",
+          linewidth = 0.6
+        ),
+        axis.ticks = ggplot2::element_line(color = "#2D2D2D"),
+        axis.text.x = ggplot2::element_text(
+          size = 10,
+          angle = 35,
+          hjust = 1
+        ),
+        panel.grid.minor = ggplot2::element_blank(),
+        panel.grid.major.y = ggplot2::element_blank()
+      )
+  })
+
   # Fit map to marker bounds when Map tab is shown (map has correct size then)
   map_bounds <- reactive({
     m <- build_ancestry_markers(map_ancestry_display())
@@ -353,10 +730,9 @@ server <- function(input, output, session){
   observeEvent(input$table_input_rows_selected, {
     md <- map_ancestry_display()
     m <- build_ancestry_markers(md)
-    proxy <- leaflet::leafletProxy("map")
-    proxy %>% leaflet::clearMarkers()
+    proxy <- leaflet::leafletProxy("map") %>% leaflet::clearMarkers()
     if (length(m$layerId) > 0) {
-      proxy %>%
+      proxy <- proxy %>%
         leaflet::addCircleMarkers(
           lng = m$lng,
           lat = m$lat,
@@ -368,16 +744,32 @@ server <- function(input, output, session){
           label = m$label
         )
     }
+    if (length(m$clusters$lng) > 0) {
+      proxy <- proxy %>%
+        leaflet::addCircleMarkers(
+          lng = m$clusters$lng,
+          lat = m$clusters$lat,
+          layerId = paste0("cluster_", seq_along(m$clusters$lng)),
+          radius = 10,
+          fillOpacity = 0.9,
+          stroke = TRUE,
+          weight = 2,
+          color = "#333333",
+          fillColor = "#E67E22",
+          popup = m$clusters$popup
+        )
+    }
   }, ignoreNULL = FALSE)
 
   # Filter Table to match clicked sites from map
   input_table_proxy = DT::dataTableProxy('table_input')
-  observeEvent(input$map_marker_click,{
+  observeEvent(input$map_marker_click, {
     id <- input$map_marker_click$id
-    if (is.null(id)) return()
+    if (is.null(id) || grepl("^cluster_", id)) return()
     # If the click corresponds to an ancestryCall Experiment, filter Table by it
-    exp_col <- if ("Experiment" %in% names(ancestryCall)) "Experiment" else if ("experiment" %in% names(ancestryCall)) "experiment" else NULL
-    if (!is.null(exp_col) && id %in% ancestryCall[[exp_col]]){
+    exp_col <- if ("Experiment" %in% names(ancestryCall)) "Experiment" else
+      if ("experiment" %in% names(ancestryCall)) "experiment" else NULL
+    if (!is.null(exp_col) && id %in% ancestryCall[[exp_col]]) {
       input_table_proxy %>% DT::clearSearch() %>% DT::updateSearch(
         keywords = list(
           global = paste(id)
