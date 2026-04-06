@@ -43,24 +43,27 @@ ui <- fluidPage(
       "Plots",
       column(
         12,
-        h4("Population-specific accuracy for selected ancestry call"),
-        p("Select one or more rows in the Table tab."),
-        plotOutput("pop_specific_accuracy_plot", height = "66vh"),
-        fluidRow(
-          column(
-            12,
-            div(
-              style = paste(
-                "display:flex;",
-                "gap:10px;",
-                "align-items:center;",
-                "justify-content:center;",
-                "margin-top:8px;"
+        tabsetPanel(
+          id = "plots_subtabs",
+          tabPanel(
+            "Accuracy",
+            p("Select one or more rows in the Table tab."),
+            h4("Population-specific accuracy confidence intervals"),
+            plotOutput("accuracy_ci_plot", height = "66vh")
+          ),
+          tabPanel(
+            "Admixture",
+            h4("Admixture proportions by molecular profile"),
+            selectInput(
+              "admixture_scope",
+              "Show proportions for",
+              choices = c(
+                "Selected table rows only" = "selected",
+                "All rows in table" = "all"
               ),
-              actionButton("plot_prev", "\u2190 Previous"),
-              strong(textOutput("plot_nav_status", inline = TRUE)),
-              actionButton("plot_next", "Next \u2192")
-            )
+              selected = "selected"
+            ),
+            plotOutput("admixture_proportion_plot", height = "62vh")
           )
         )
       )
@@ -470,58 +473,23 @@ server <- function(input, output, session){
     unique(ids)
   })
 
-  plot_idx <- reactiveVal(1L)
+  all_table_ancestry_call_ids <- reactive({
+    if (!"ancestryCallId" %in% names(ancestryCall)) return(integer(0))
+    ids <- suppressWarnings(as.integer(ancestryCall$ancestryCallId))
+    unique(ids[is.finite(ids)])
+  })
 
-  observeEvent(input$table_input_rows_selected, {
+  admixture_plot_ancestry_call_ids <- reactive({
+    scope <- input$admixture_scope
+    if (is.null(scope) || identical(scope, "selected")) {
+      return(selected_ancestry_call_ids())
+    }
+    all_table_ancestry_call_ids()
+  })
+
+  output$accuracy_ci_plot <- renderPlot({
     ids <- selected_ancestry_call_ids()
     if (!length(ids)) {
-      plot_idx(1L)
-      return()
-    }
-    cur <- isolate(plot_idx())
-    if (!is.finite(cur) || cur < 1L || cur > length(ids)) {
-      plot_idx(1L)
-    }
-  }, ignoreNULL = FALSE)
-
-  observeEvent(input$plot_prev, {
-    ids <- selected_ancestry_call_ids()
-    if (!length(ids)) return()
-    cur <- isolate(plot_idx())
-    if (!is.finite(cur)) cur <- 1L
-    plot_idx(max(1L, cur - 1L))
-  })
-
-  observeEvent(input$plot_next, {
-    ids <- selected_ancestry_call_ids()
-    if (!length(ids)) return()
-    cur <- isolate(plot_idx())
-    if (!is.finite(cur)) cur <- 1L
-    plot_idx(min(length(ids), cur + 1L))
-  })
-
-  current_ancestry_call_id <- reactive({
-    ids <- selected_ancestry_call_ids()
-    if (!length(ids)) return(NULL)
-    idx <- plot_idx()
-    if (!is.finite(idx)) idx <- 1L
-    idx <- max(1L, min(as.integer(idx), length(ids)))
-    ids[idx]
-  })
-
-  output$plot_nav_status <- renderText({
-    ids <- selected_ancestry_call_ids()
-    n <- length(ids)
-    if (!n) return("Sample 0 of 0")
-    idx <- plot_idx()
-    if (!is.finite(idx)) idx <- 1L
-    idx <- max(1L, min(as.integer(idx), n))
-    paste("Sample", idx, "of", n)
-  })
-
-  output$pop_specific_accuracy_plot <- renderPlot({
-    ac_id <- current_ancestry_call_id()
-    if (is.null(ac_id)) {
       return(
         ggplot2::ggplot() +
           ggplot2::theme_void() +
@@ -534,6 +502,7 @@ server <- function(input, output, session){
       )
     }
 
+    ac_id <- ids[1]
     pop_acc <- getPopSpecificAccuracyForAncestryCall(ac_id)
     if (!nrow(pop_acc)) {
       return(
@@ -601,7 +570,6 @@ server <- function(input, output, session){
 
     keep <- is.finite(pop_acc$accuracy)
     pop_acc <- pop_acc[keep, , drop = FALSE]
-
     if (!nrow(pop_acc)) {
       return(
         ggplot2::ggplot() +
@@ -615,15 +583,12 @@ server <- function(input, output, session){
       )
     }
 
-    y_label <- "Accuracy (%)"
     pop_acc <- pop_acc %>%
       dplyr::mutate(
         accuracy = .data$accuracy * 100,
         CILowerBound = .data$CILowerBound * 100,
         CIUpperBound = .data$CIUpperBound * 100
-      )
-
-    pop_acc <- pop_acc %>%
+      ) %>%
       dplyr::arrange(.data$accuracy) %>%
       dplyr::mutate(
         populationDefinition = factor(
@@ -676,7 +641,7 @@ server <- function(input, output, session){
         title = "Accuracy with confidence intervals",
         subtitle = paste("ancestryCallId:", ac_id),
         x = "Population definition",
-        y = y_label,
+        y = "Accuracy (%)",
         fill = NULL,
         color = NULL
       ) +
@@ -700,6 +665,196 @@ server <- function(input, output, session){
         panel.grid.minor = ggplot2::element_blank(),
         panel.grid.major.y = ggplot2::element_blank()
       )
+  })
+
+  output$admixture_proportion_plot <- renderPlot({
+    ids <- admixture_plot_ancestry_call_ids()
+    scope <- input$admixture_scope
+    is_all <- !is.null(scope) && identical(scope, "all")
+
+    if (!length(ids)) {
+      empty_lab <- if (is_all) {
+        "No ancestry calls in the table."
+      } else {
+        "No ancestry call selected in the Table tab."
+      }
+      return(
+        ggplot2::ggplot() +
+          ggplot2::theme_void() +
+          ggplot2::annotate(
+            "text",
+            x = 0.5,
+            y = 0.5,
+            label = empty_lab
+          )
+      )
+    }
+
+    props <- getAdmixtureProportionsForAncestryCalls(ids)
+    if (!nrow(props)) {
+      no_prop_lab <- if (is_all) {
+        paste(
+          "No admixture proportions found for ancestry calls in the table."
+        )
+      } else {
+        paste(
+          "No admixture proportions found for selected ancestry calls."
+        )
+      }
+      return(
+        ggplot2::ggplot() +
+          ggplot2::theme_void() +
+          ggplot2::annotate(
+            "text",
+            x = 0.5,
+            y = 0.5,
+            label = no_prop_lab
+          )
+      )
+    }
+
+    props <- props %>%
+      dplyr::mutate(
+        ancestryCallId = suppressWarnings(as.integer(.data$ancestryCallId)),
+        populationDefinition = as.character(.data$populationDefinition),
+        proportion = suppressWarnings(
+          as.numeric(as.character(.data$proportion))
+        )
+      )
+
+    props <- props[is.finite(props$proportion), , drop = FALSE]
+    if (!nrow(props)) {
+      return(ggplot2::ggplot() + ggplot2::theme_void())
+    }
+
+    props <- props %>%
+      dplyr::mutate(
+        profileLabel = paste("molecularProfile", .data$molecularProfileId),
+        populationDefinition = dplyr::if_else(
+          is.na(.data$populationDefinition) |
+            !nzchar(trimws(.data$populationDefinition)),
+          "Unknown",
+          .data$populationDefinition
+        )
+      )
+
+    prof_order <- props %>%
+      dplyr::distinct(.data$ancestryCallId, .data$profileLabel) %>%
+      dplyr::arrange(
+        factor(.data$ancestryCallId, levels = ids),
+        .data$profileLabel
+      ) %>%
+      dplyr::pull(.data$profileLabel)
+
+    pop_order <- c("AMR", "EUR", "EAS", "SAS", "AFR", "Admixed")
+    in_data <- unique(as.character(props$populationDefinition))
+    in_data <- in_data[!is.na(in_data)]
+    ordered_acr <- intersect(pop_order, in_data)
+    rest <- sort(setdiff(in_data, pop_order))
+    pop_levels <- c(ordered_acr, rest)
+
+    props <- props %>%
+      dplyr::mutate(
+        profileLabel = factor(.data$profileLabel, levels = prof_order),
+        populationDefinition = factor(
+          .data$populationDefinition,
+          levels = pop_levels
+        )
+      )
+
+    profile_super <- props %>%
+      dplyr::group_by(.data$profileLabel) %>%
+      dplyr::slice_max(
+        order_by = .data$proportion,
+        n = 1,
+        with_ties = FALSE
+      ) %>%
+      dplyr::ungroup() %>%
+      dplyr::transmute(
+        profileLabel = .data$profileLabel,
+        superPop = .data$populationDefinition
+      )
+
+    color_blind_black8 <- c(
+      "#E69F00", "#CC79A7", "#009E73",
+      "#0072B9", "#56B4E0", "#C0C0C0"
+    )
+    fill_vals <- stats::setNames(
+      rep(color_blind_black8, length.out = length(pop_levels)),
+      pop_levels
+    )
+
+    graph1 <- ggplot2::ggplot(props) +
+      ggplot2::aes(
+        x = .data$profileLabel,
+        y = .data$proportion,
+        fill = .data$populationDefinition
+      ) +
+      ggplot2::geom_col() +
+      ggplot2::theme_bw() +
+      ggplot2::xlab("") +
+      ggplot2::ylab("Proportion") +
+      ggplot2::labs(fill = "Population definition") +
+      ggplot2::scale_y_continuous(expand = c(0, 0)) +
+      ggplot2::scale_fill_manual(
+        breaks = pop_levels,
+        values = fill_vals
+      )
+
+    theme_stack <- ggplot2::theme(
+      axis.text.x = ggplot2::element_blank(),
+      axis.text.y = ggplot2::element_text(size = 10, face = "bold"),
+      axis.title = ggplot2::element_text(size = 12, face = "bold"),
+      legend.title = ggplot2::element_text(face = "bold", size = 12),
+      legend.text = ggplot2::element_text(face = "bold", size = 11)
+    )
+
+    graph1_main <- graph1 + theme_stack +
+      ggplot2::theme(legend.position = "none")
+
+    legend_grob <- cowplot::get_legend(
+      graph1 + theme_stack +
+        ggplot2::theme(
+          legend.position = "right",
+          legend.title = ggplot2::element_text(face = "bold", size = 12),
+          legend.text = ggplot2::element_text(face = "bold", size = 11)
+        )
+    )
+
+    ancestry_graph <- ggplot2::ggplot(profile_super) +
+      ggplot2::geom_bar(
+        ggplot2::aes(
+          x = .data$profileLabel,
+          y = 1,
+          fill = .data$superPop
+        ),
+        stat = "identity",
+        width = 1
+      ) +
+      ggplot2::theme_void() +
+      ggplot2::theme(legend.position = "none") +
+      ggplot2::scale_fill_manual(
+        breaks = pop_levels,
+        values = fill_vals
+      )
+
+    plot_body <- cowplot::plot_grid(
+      ancestry_graph,
+      graph1_main,
+      align = "v",
+      ncol = 1,
+      axis = "tb",
+      rel_heights = c(0.5, 15)
+    )
+
+    cowplot::plot_grid(
+      plot_body,
+      legend_grob,
+      ncol = 2,
+      rel_widths = c(10, 2),
+      align = "h",
+      axis = "tb"
+    )
   })
 
   # Fit map to marker bounds when Map tab is shown (map has correct size then)

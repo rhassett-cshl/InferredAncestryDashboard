@@ -1,10 +1,19 @@
 library(pool)
 library(dplyr)
 
+# Single place for the SQLite file. Override with ANCESTRY_SQLITE_DB if needed.
+ANCESTRY_SQLITE_DB <- Sys.getenv(
+  "ANCESTRY_SQLITE_DB",
+  unset = file.path(
+    "C:/Users/hassett/Documents/AncestryInferenceApp",
+    "ancestryinference_v0_8.db"
+  )
+)
+
 getPopSpecificAccuracyForAncestryCall <- function(ancestry_call_id) {
   db <- dbPool(
     RSQLite::SQLite(),
-    dbname = "C:/Users/hassett/Documents/AncestryInferenceApp/ancestryinference_v0_8.db"
+    dbname = ANCESTRY_SQLITE_DB
   )
   on.exit(poolClose(db))
 
@@ -61,7 +70,7 @@ getPopSpecificAccuracyForAncestryCall <- function(ancestry_call_id) {
 getAncestryCallAccuracyForPlot <- function(ancestry_call_id) {
   db <- dbPool(
     RSQLite::SQLite(),
-    dbname = "C:/Users/hassett/Documents/AncestryInferenceApp/ancestryinference_v0_8.db"
+    dbname = ANCESTRY_SQLITE_DB
   )
   on.exit(poolClose(db))
 
@@ -124,10 +133,51 @@ getAncestryCallAccuracyForPlot <- function(ancestry_call_id) {
   as.data.frame(out)
 }
 
+getAdmixtureProportionsForAncestryCalls <- function(ancestry_call_ids) {
+  db <- dbPool(
+    RSQLite::SQLite(),
+    dbname = ANCESTRY_SQLITE_DB
+  )
+  on.exit(poolClose(db))
+
+  ids <- suppressWarnings(as.integer(ancestry_call_ids))
+  ids <- ids[is.finite(ids)]
+  ids <- unique(ids)
+  if (!length(ids)) {
+    return(data.frame())
+  }
+
+  placeholders <- paste(rep("?", length(ids)), collapse = ", ")
+  qry <- paste(
+    "SELECT",
+    "ac.ancestryCallId AS ancestryCallId,",
+    "ac.molecularProfileId AS molecularProfileId,",
+    "pd.name AS populationDefinition,",
+    "ap.proportion AS proportion",
+    "FROM ancestryCall ac",
+    "LEFT JOIN molecularProfile mp",
+    "  ON ac.molecularProfileId = mp.molecularProfileId",
+    "INNER JOIN ancestralAdmixtures aa",
+    "  ON ac.molecularProfileId = aa.molecularProfileId",
+    "INNER JOIN admixtureProportion ap",
+    "  ON aa.ancestralAdmixturesId = ap.ancestralAdmixturesId",
+    "LEFT JOIN populationDefinition pd",
+    "  ON ap.populationDefinitionId = pd.populationDefinitionId",
+    sprintf("WHERE ac.ancestryCallId IN (%s)", placeholders),
+    "ORDER BY ac.ancestryCallId, ap.admixtureProportionId"
+  )
+
+  out <- DBI::dbGetQuery(db, qry, params = as.list(ids))
+  if (!nrow(out)) {
+    return(data.frame())
+  }
+  as.data.frame(out)
+}
+
 loadTableData <- function() {
   db <- dbPool(
     RSQLite::SQLite(),
-    dbname = "C:/Users/hassett/Documents/AncestryInferenceApp/ancestryinference_v0_8.db"
+    dbname = ANCESTRY_SQLITE_DB
   )
 
   on.exit(poolClose(db))
@@ -176,8 +226,6 @@ loadTableData <- function() {
       by = "populationResolutionId",
       suffix = c("", "_populationResolution")
     )
-
-  print(base_tbl)
 
   selected <- base_tbl %>%
     dplyr::select(dplyr::any_of(c(
