@@ -82,6 +82,11 @@ ui <- fluidPage(
 
 server <- function(input, output, session){
 
+  # leafletProxy only after output$map has rendered (reactiveVal so observers
+  # re-run when the map becomes ready after table inputs already fired).
+  map_output_ready <- reactiveVal(FALSE)
+  ancestry_data_version <- reactiveVal(0L)
+
   # Loading modal to keep user out of trouble while ancestryCall loads
   showModal(modalDialog(
     title = "LOADING - PLEASE WAIT...",
@@ -97,9 +102,6 @@ server <- function(input, output, session){
     removeModal()
   })
 
-  # Extract ancestry calls with population definition coordinates
-  ancestryCall <- loadTableData()
-  ancestry_ready$loaded <- TRUE
   # Human-friendly labels for ancestryCall columns used elsewhere
   labels_map <- c(
     experiment = "Experiment",
@@ -115,9 +117,117 @@ server <- function(input, output, session){
     latitude = "latitude",
     longitude = "longitude"
   )
-  cols_to_rename <- intersect(names(labels_map), names(ancestryCall))
-  names(ancestryCall)[match(cols_to_rename, names(ancestryCall))] <-
-    labels_map[cols_to_rename]
+  prepare_ancestry_call <- function(ac) {
+    if (is.null(ac) || !is.data.frame(ac)) {
+      ac <- empty_ancestry_call()
+    }
+
+    cols_to_rename <- intersect(names(labels_map), names(ac))
+    names(ac)[match(cols_to_rename, names(ac))] <- labels_map[cols_to_rename]
+
+    if ("Accuracy" %in% names(ac)) {
+      acc <- suppressWarnings(as.numeric(ac$Accuracy))
+      is_num <- !is.na(acc) & is.finite(acc)
+      if (any(is_num)) {
+        max_v <- max(acc[is_num], na.rm = TRUE)
+        scale_factor <- if (max_v <= 1) 100 else 1
+        fmt <- rep(NA_character_, length(acc))
+        fmt[is_num] <- sprintf("%.2f%%", acc[is_num] * scale_factor)
+        if (any(!is_num)) {
+          fmt[!is_num] <- as.character(ac$Accuracy[!is_num])
+        }
+        ac$Accuracy <- fmt
+      }
+    }
+
+    # Show Experiment as SRA link only when source database contains "SRA".
+    if ("Experiment" %in% names(ac)) {
+      db_col <- if ("database" %in% names(ac)) "database" else NULL
+      ac$Experiment <- vapply(
+        seq_len(nrow(ac)),
+        function(i) {
+          val <- as.character(ac$Experiment[i])
+          if (is.na(val) || !nzchar(trimws(val))) return("")
+          is_sra <- FALSE
+          if (!is.null(db_col)) {
+            db_val <- as.character(ac[[db_col]][i])
+            is_sra <- !is.na(db_val) &&
+              grepl("SRA", db_val, ignore.case = TRUE)
+          }
+          if (!is_sra) return(val)
+          url <- paste0(
+            "https://www.ncbi.nlm.nih.gov/sra/?term=",
+            utils::URLencode(val, reserved = TRUE)
+          )
+          paste0(
+            '<a href="', url,
+            '" target="_blank" rel="noopener">', val, "</a>"
+          )
+        },
+        FUN.VALUE = character(1)
+      )
+    }
+
+    ac
+  }
+  empty_ancestry_call <- function() {
+    empty_cols <- c(
+      "ancestryCallId",
+      "database",
+      names(labels_map)
+    )
+    out <- as.data.frame(
+      lapply(empty_cols, function(x) character(0)),
+      stringsAsFactors = FALSE
+    )
+    names(out) <- empty_cols
+    out
+  }
+
+  # Extract ancestry calls with population definition coordinates.
+  # If data is not available yet, keep app responsive with empty placeholders.
+  ancestry_loaded_ok <- TRUE
+  ancestryCall <- tryCatch(
+    loadTableData(),
+    error = function(e) {
+      ancestry_loaded_ok <<- FALSE
+      warning(
+        "loadTableData() failed at startup; using empty placeholders. ",
+        conditionMessage(e)
+      )
+      empty_ancestry_call()
+    }
+  )
+  ancestryCall <- prepare_ancestry_call(ancestryCall)
+  if (!is.data.frame(ancestryCall)) ancestryCall <- empty_ancestry_call()
+  ancestry_ready$loaded <- TRUE
+  if (!ancestry_loaded_ok || nrow(ancestryCall) == 0) {
+    showNotification(
+      "No ancestry data loaded yet. Map and table are currently empty.",
+      type = "message",
+      duration = 8
+    )
+  }
+  observe({
+    invalidateLater(15000, session)
+    if (nrow(ancestryCall) > 0) return()
+    ac_retry <- tryCatch(
+      loadTableData(),
+      error = function(e) NULL
+    )
+    if (is.null(ac_retry) || !is.data.frame(ac_retry)) return()
+    ac_retry <- prepare_ancestry_call(ac_retry)
+    if (nrow(ac_retry) < 1) return()
+    ancestryCall <<- ac_retry
+    ancestry_data_version(ancestry_data_version() + 1L)
+    showNotification(
+      paste(
+        "Ancestry data is now loaded. Table and map were refreshed."
+      ),
+      type = "message",
+      duration = 6
+    )
+  })
 
   # Empty reactive values object
   reactive_objects=reactiveValues()
@@ -129,12 +239,26 @@ server <- function(input, output, session){
 
   # Map: render once ancestryCall is loaded
   output$map <- leaflet::renderLeaflet({
+    ancestry_data_version()
     m <- build_ancestry_markers(ancestryCall)
+    map_output_ready(TRUE)
     lng_r <- range(m$lng, na.rm = TRUE)
     lat_r <- range(m$lat, na.rm = TRUE)
     if (length(m$layerId) == 0) {
-      return(leaflet::leaflet() %>%
-        leaflet::addTiles(options = leaflet::tileOptions(noWrap = TRUE)))
+      return(
+        leaflet::leaflet() %>%
+          leaflet::addTiles(
+            options = leaflet::tileOptions(noWrap = TRUE)
+          ) %>%
+          leaflet::addControl(
+            html = paste(
+              "<div style='background: rgba(255,255,255,0.9);",
+              "padding: 8px 10px; border-radius: 4px;'>",
+              "No map points to display yet.</div>"
+            ),
+            position = "topright"
+          )
+      )
     }
     if (diff(lng_r) == 0) lng_r <- lng_r + c(-0.5, 0.5)
     if (diff(lat_r) == 0) lat_r <- lat_r + c(-0.5, 0.5)
@@ -178,65 +302,15 @@ server <- function(input, output, session){
       )
   })
   
-  # ancestryCall already loaded and labeled above
-
-  # Format Accuracy as percentage (two decimals)
-  if ("Accuracy" %in% names(ancestryCall)){
-    acc <- suppressWarnings(
-      as.numeric(ancestryCall$Accuracy)
-    )
-    is_num <- !is.na(acc) & is.finite(acc)
-    if (any(is_num)){
-      max_v <- max(acc[is_num], na.rm = TRUE)
-      scale_factor <- if (max_v <= 1) 100 else 1
-      fmt <- rep(NA_character_, length(acc))
-      fmt[is_num] <- sprintf(
-        "%.2f%%",
-        acc[is_num] * scale_factor
-      )
-      if (any(!is_num)){
-        fmt[!is_num] <- as.character(
-          ancestryCall$Accuracy[!is_num]
-        )
-      }
-      ancestryCall$Accuracy <- fmt
-    }
-  }
-
-  # Show Experiment as SRA link only when source database contains "SRA"
-  if ("Experiment" %in% names(ancestryCall)) {
-    db_col <- if ("database" %in% names(ancestryCall)) "database" else NULL
-    ancestryCall$Experiment <- vapply(
-      seq_len(nrow(ancestryCall)),
-      function(i) {
-        val <- as.character(ancestryCall$Experiment[i])
-        if (is.na(val) || !nzchar(trimws(val))) return("")
-        is_sra <- FALSE
-        if (!is.null(db_col)) {
-          db_val <- as.character(ancestryCall[[db_col]][i])
-          is_sra <- !is.na(db_val) && grepl("SRA", db_val, ignore.case = TRUE)
-        }
-        if (!is_sra) return(val)
-        url <- paste0(
-          "https://www.ncbi.nlm.nih.gov/sra/?term=",
-          utils::URLencode(val, reserved = TRUE)
-        )
-        paste0(
-          '<a href="', url,
-          '" target="_blank" rel="noopener">', val, "</a>"
-        )
-      },
-      FUN.VALUE = character(1)
-    )
-  }
-
   # Table interface (exclude lat/long and database from display)
-  table_cols <- setdiff(
-    names(ancestryCall),
-    c("ancestryCallId", "latitude", "longitude", "database")
-  )
   output$table_input=DT::renderDataTable({
-    tbl <- ancestryCall[, table_cols, drop = FALSE]
+    ancestry_data_version()
+    ac <- ancestryCall
+    table_cols <- setdiff(
+      names(ac),
+      c("ancestryCallId", "latitude", "longitude", "database")
+    )
+    tbl <- ac[, table_cols, drop = FALSE]
     # Force all columns to character so DT uses text filter (searchable) in each
     for (col in names(tbl)) {
       if (col != "Experiment")
@@ -262,6 +336,9 @@ server <- function(input, output, session){
         paging = FALSE,
         searching = TRUE,
         orderCellsTop = TRUE,
+        language = list(
+          emptyTable = "No ancestry data loaded yet."
+        ),
         search = list(regex = FALSE, caseInsensitive = TRUE),
         columnDefs = list(
           list(targets = "_all", className = "dt-left"),
@@ -297,6 +374,7 @@ server <- function(input, output, session){
 
   # Ancestry rows to show on map: all with coords, or only selected table rows
   map_ancestry_display <- reactive({
+    ancestry_data_version()
     ac <- ancestryCall
     sel <- input$table_input_rows_selected
     if (length(sel) > 0) ac <- ac[sel, , drop = FALSE]
@@ -465,6 +543,7 @@ server <- function(input, output, session){
   )
 
   selected_ancestry_call_ids <- reactive({
+    ancestry_data_version()
     sel <- input$table_input_rows_selected
     if (length(sel) < 1) return(integer(0))
     if (!"ancestryCallId" %in% names(ancestryCall)) return(integer(0))
@@ -474,6 +553,7 @@ server <- function(input, output, session){
   })
 
   all_table_ancestry_call_ids <- reactive({
+    ancestry_data_version()
     if (!"ancestryCallId" %in% names(ancestryCall)) return(integer(0))
     ids <- suppressWarnings(as.integer(ancestryCall$ancestryCallId))
     unique(ids[is.finite(ids)])
@@ -868,6 +948,7 @@ server <- function(input, output, session){
     list(lng1 = lng_r[1], lat1 = lat_r[1], lng2 = lng_r[2], lat2 = lat_r[2])
   })
   observeEvent(input$main_tabs, {
+    req(map_output_ready())
     if (input$main_tabs != "Map") return()
     b <- map_bounds()
     if (is.null(b)) return()
@@ -879,10 +960,12 @@ server <- function(input, output, session){
         lat2 = b$lat2,
         options = list(padding = c(20, 20))
       )
-  }, ignoreInit = FALSE)
+  }, ignoreInit = TRUE)
 
-  # Table selection: show only selected rows on map (or all if none selected)
-  observeEvent(input$table_input_rows_selected, {
+  # Table selection: sync map markers to table selection. observe() ties into
+  # map_output_ready() so a late-ready map still updates after server timing.
+  observe({
+    req(map_output_ready())
     md <- map_ancestry_display()
     m <- build_ancestry_markers(md)
     proxy <- leaflet::leafletProxy("map") %>% leaflet::clearMarkers()
@@ -914,7 +997,7 @@ server <- function(input, output, session){
           popup = m$clusters$popup
         )
     }
-  }, ignoreNULL = FALSE)
+  })
 
   # Filter Table to match clicked sites from map
   input_table_proxy = DT::dataTableProxy('table_input')
@@ -937,16 +1020,6 @@ server <- function(input, output, session){
       )
     }
   })
-
-
-  ## Map polygon click
-  #observe({
-  #  req(profiles_long)
-  #  au_click <- input$map_shape_click
-  #  #if (is.null(au_click)){return()}
-  #  auid=au_click$id
-  #  print(au_click$id)
-  #})
 
 }
 
