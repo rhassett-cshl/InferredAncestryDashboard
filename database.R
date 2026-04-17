@@ -10,6 +10,46 @@ ANCESTRY_SQLITE_DB <- Sys.getenv(
   )
 )
 
+getContinentalPopulationDefinitions <- function() {
+  db <- dbPool(
+    RSQLite::SQLite(),
+    dbname = ANCESTRY_SQLITE_DB
+  )
+  on.exit(poolClose(db))
+
+  qry <- paste(
+    "SELECT",
+    "pd.populationDefinitionId,",
+    "pd.acronym,",
+    "pd.name",
+    "FROM populationDefinition pd",
+    "INNER JOIN populationResolution pr",
+    "  ON pd.populationResolutionId =",
+    "     pr.populationResolutionId",
+    "WHERE pr.name = 'Continental'",
+    "ORDER BY pd.populationDefinitionId"
+  )
+  out <- DBI::dbGetQuery(db, qry)
+  if (!nrow(out)) {
+    return(data.frame())
+  }
+  as.data.frame(out)
+}
+
+continental_axis_label_lookup <- function(continental_df) {
+  if (!is.data.frame(continental_df) || !nrow(continental_df)) {
+    return(character(0))
+  }
+  nm <- as.character(continental_df$name)
+  ac <- trimws(as.character(continental_df$acronym))
+  lab <- ifelse(
+    !is.na(ac) & nzchar(ac),
+    paste0(ac, " — ", nm),
+    nm
+  )
+  stats::setNames(lab, nm)
+}
+
 getPopSpecificAccuracyForAncestryCall <- function(ancestry_call_id) {
   db <- dbPool(
     RSQLite::SQLite(),

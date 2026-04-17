@@ -2,6 +2,62 @@ library(magrittr)
 library(htmltools)
 source("database.R")
 
+# Okabe–Ito for the first six; further colors chosen to maximize minimum
+# Euclidean distance in Lab from every color already assigned
+admixture_fill_palette <- function(n) {
+  if (n < 1L) {
+    return(character(0))
+  }
+  base <- c(
+    "#E69F00", "#CC79A7", "#009E73",
+    "#0072B9", "#56B4E0"
+  )
+  if (n <= length(base)) {
+    return(base[seq_len(n)])
+  }
+  lab_mat <- function(hex_vec) {
+    rgb <- grDevices::col2rgb(hex_vec, alpha = FALSE) / 255
+    grDevices::convertColor(
+      t(rgb),
+      from = "sRGB",
+      to = "Lab",
+      scale.in = 1
+    )
+  }
+  golden_deg <- 137.508
+  chosen <- base
+  extras <- as.integer(n - length(base))
+  for (i in seq_len(extras)) {
+    l_chosen <- lab_mat(chosen)
+    best_hex <- NULL
+    best_min_d <- -1
+    for (k in seq_len(360L)) {
+      h <- ((k * golden_deg) + 41 * i) %% 360
+      for (cand_c in c(60, 52, 68)) {
+        for (cand_l in c(56, 50, 62)) {
+          cand <- grDevices::hcl(
+            h = h,
+            c = cand_c,
+            l = cand_l,
+            fixup = TRUE
+          )
+          l_new <- lab_mat(cand)
+          dvec <- sqrt(rowSums(
+            sweep(l_chosen, 2L, as.numeric(l_new), FUN = "-")^2
+          ))
+          dmin <- min(dvec)
+          if (dmin > best_min_d) {
+            best_min_d <- dmin
+            best_hex <- cand
+          }
+        }
+      }
+    }
+    chosen <- c(chosen, best_hex)
+  }
+  chosen
+}
+
 ui <- fluidPage(
   # Header
   headerPanel(
@@ -49,7 +105,21 @@ ui <- fluidPage(
             "Accuracy",
             p("Select one or more rows in the Table tab."),
             h4("Population-specific accuracy confidence intervals"),
-            plotOutput("accuracy_ci_plot", height = "66vh")
+            plotOutput("accuracy_ci_plot", height = "66vh"),
+            fluidRow(
+              column(
+                12,
+                div(
+                  style = paste0(
+                    "display:flex;justify-content:center;",
+                    "gap:10px;align-items:center;margin-top:8px;"
+                  ),
+                  actionButton("plot_prev", "\u2190 Previous"),
+                  strong(textOutput("plot_nav_status", inline = TRUE)),
+                  actionButton("plot_next", "Next \u2192")
+                )
+              )
+            )
           ),
           tabPanel(
             "Admixture",
@@ -62,6 +132,27 @@ ui <- fluidPage(
                 "All rows in table" = "all"
               ),
               selected = "selected"
+            ),
+            selectizeInput(
+              "admixture_order_population",
+              label = paste(
+                "Sort bars by population share",
+                "(optional, multi-level)"
+              ),
+              choices = NULL,
+              selected = NULL,
+              multiple = TRUE,
+              options = list(
+                plugins = list("remove_button", "drag_drop"),
+                placeholder = "Table row order (no sort)"
+              )
+            ),
+            helpText(
+              paste(
+                "Select populations in priority order, or drag tags",
+                "to reorder. Bars sort by highest share of the first",
+                "population, then ties by the second, and so on."
+              )
             ),
             plotOutput("admixture_proportion_plot", height = "62vh")
           )
@@ -86,6 +177,18 @@ server <- function(input, output, session){
   # re-run when the map becomes ready after table inputs already fired).
   map_output_ready <- reactiveVal(FALSE)
   ancestry_data_version <- reactiveVal(0L)
+
+  continental_meta <- reactive({
+    df <- getContinentalPopulationDefinitions()
+    list(
+      ordered_names = if (nrow(df)) {
+        as.character(df$name)
+      } else {
+        character(0)
+      },
+      label_by_name = continental_axis_label_lookup(df)
+    )
+  })
 
   # Loading modal to keep user out of trouble while ancestryCall loads
   showModal(modalDialog(
@@ -567,9 +670,132 @@ server <- function(input, output, session){
     all_table_ancestry_call_ids()
   })
 
-  output$accuracy_ci_plot <- renderPlot({
+  observe({
+    ancestry_data_version()
+    input$admixture_scope
+    ids <- admixture_plot_ancestry_call_ids()
+    prev <- isolate(input$admixture_order_population)
+    if (is.null(prev)) {
+      prev <- character(0)
+    }
+    if (length(prev) == 1L && identical(prev, "__table__")) {
+      prev <- character(0)
+    }
+    clear_sel <- function() {
+      updateSelectizeInput(
+        session,
+        "admixture_order_population",
+        choices = character(0),
+        selected = character(0),
+        server = TRUE
+      )
+    }
+    if (!length(ids)) {
+      clear_sel()
+      return()
+    }
+    raw <- getAdmixtureProportionsForAncestryCalls(ids)
+    if (!nrow(raw)) {
+      clear_sel()
+      return()
+    }
+    prop_col <- suppressWarnings(
+      as.numeric(as.character(raw$proportion))
+    )
+    raw <- raw[is.finite(prop_col), , drop = FALSE]
+    if (!nrow(raw)) {
+      clear_sel()
+      return()
+    }
+    pop_def <- as.character(raw$populationDefinition)
+    bad <- is.na(pop_def) | !nzchar(trimws(pop_def))
+    pop_def[bad] <- "Unknown"
+    pops_in <- unique(pop_def)
+    cm <- continental_meta()
+    pop_canon <- cm$ordered_names
+    pops_sorted <- c(
+      intersect(pop_canon, pops_in),
+      sort(setdiff(pops_in, pop_canon))
+    )
+    prev <- prev[prev %in% pops_sorted]
+    prev <- prev[!duplicated(prev)]
+    updateSelectizeInput(
+      session,
+      "admixture_order_population",
+      choices = pops_sorted,
+      selected = prev,
+      server = TRUE
+    )
+  })
+
+  plot_idx <- reactiveVal(1L)
+
+  observeEvent(input$table_input_rows_selected, {
     ids <- selected_ancestry_call_ids()
     if (!length(ids)) {
+      plot_idx(1L)
+      return()
+    }
+    cur <- isolate(plot_idx())
+    if (!is.finite(cur) || cur < 1L || cur > length(ids)) {
+      plot_idx(1L)
+    }
+  }, ignoreNULL = FALSE)
+
+  observeEvent(input$plot_prev, {
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) {
+      return()
+    }
+    cur <- isolate(plot_idx())
+    if (!is.finite(cur)) {
+      cur <- 1L
+    }
+    plot_idx(max(1L, cur - 1L))
+  })
+
+  observeEvent(input$plot_next, {
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) {
+      return()
+    }
+    cur <- isolate(plot_idx())
+    if (!is.finite(cur)) {
+      cur <- 1L
+    }
+    plot_idx(min(length(ids), cur + 1L))
+  })
+
+  current_ancestry_call_id <- reactive({
+    ids <- selected_ancestry_call_ids()
+    if (!length(ids)) {
+      return(NULL)
+    }
+    idx <- plot_idx()
+    if (!is.finite(idx)) {
+      idx <- 1L
+    }
+    idx <- max(1L, min(as.integer(idx), length(ids)))
+    ids[idx]
+  })
+
+  output$plot_nav_status <- renderText({
+    ids <- selected_ancestry_call_ids()
+    n <- length(ids)
+    if (!n) {
+      return("Sample 0 of 0")
+    }
+    idx <- plot_idx()
+    if (!is.finite(idx)) {
+      idx <- 1L
+    }
+    idx <- max(1L, min(as.integer(idx), n))
+    paste("Sample", idx, "of", n)
+  })
+
+  output$accuracy_ci_plot <- renderPlot({
+    ac_id <- current_ancestry_call_id()
+    if (is.null(ac_id)) {
       return(
         ggplot2::ggplot() +
           ggplot2::theme_void() +
@@ -581,8 +807,6 @@ server <- function(input, output, session){
           )
       )
     }
-
-    ac_id <- ids[1]
     pop_acc <- getPopSpecificAccuracyForAncestryCall(ac_id)
     if (!nrow(pop_acc)) {
       return(
@@ -661,6 +885,17 @@ server <- function(input, output, session){
             label = "No numeric accuracy values available."
           )
       )
+    }
+
+    cm_ci <- continental_meta()
+    labs_ci <- cm_ci$label_by_name
+    if (length(labs_ci)) {
+      sel_pd <- pop_acc$series == "Population definition"
+      m_ci <- match(pop_acc$populationDefinition[sel_pd], names(labs_ci))
+      ok_ci <- !is.na(m_ci)
+      idx_ci <- which(sel_pd)[ok_ci]
+      pop_acc$populationDefinition[idx_ci] <-
+        unname(labs_ci)[m_ci[ok_ci]]
     }
 
     pop_acc <- pop_acc %>%
@@ -818,7 +1053,7 @@ server <- function(input, output, session){
         )
       )
 
-    prof_order <- props %>%
+    prof_order_base <- props %>%
       dplyr::distinct(.data$ancestryCallId, .data$profileLabel) %>%
       dplyr::arrange(
         factor(.data$ancestryCallId, levels = ids),
@@ -826,12 +1061,91 @@ server <- function(input, output, session){
       ) %>%
       dplyr::pull(.data$profileLabel)
 
-    pop_order <- c("AMR", "EUR", "EAS", "SAS", "AFR", "Admixed")
+    ord_pops <- input$admixture_order_population
+    if (is.null(ord_pops)) {
+      ord_pops <- character(0)
+    }
+    ord_pops <- ord_pops[nzchar(ord_pops)]
+    if (length(ord_pops) == 1L && identical(ord_pops, "__table__")) {
+      ord_pops <- character(0)
+    }
+    pop_names <- unique(as.character(props$populationDefinition))
+    ord_pops <- ord_pops[ord_pops %in% pop_names]
+    ord_pops <- ord_pops[!duplicated(ord_pops)]
+    if (length(ord_pops)) {
+      sort_props <- props %>%
+        dplyr::filter(
+          as.character(.data$populationDefinition) %in% ord_pops
+        ) %>%
+        dplyr::group_by(.data$profileLabel, .data$populationDefinition) %>%
+        dplyr::summarise(
+          sort_prop = max(.data$proportion, na.rm = TRUE),
+          .groups = "drop"
+        )
+      prof_order_tbl <- dplyr::tibble(
+        profileLabel = prof_order_base,
+        base_idx = seq_along(prof_order_base)
+      )
+      for (i in seq_along(ord_pops)) {
+        p <- ord_pops[[i]]
+        sp <- sort_props %>%
+          dplyr::filter(
+            as.character(.data$populationDefinition) == p
+          ) %>%
+          dplyr::transmute(
+            profileLabel = .data$profileLabel,
+            sort_col = .data$sort_prop
+          )
+        jn <- paste0("sort__", i)
+        prof_order_tbl <- dplyr::left_join(
+          prof_order_tbl,
+          sp,
+          by = "profileLabel"
+        )
+        names(prof_order_tbl)[ncol(prof_order_tbl)] <- jn
+        prof_order_tbl[[jn]] <- dplyr::coalesce(
+          prof_order_tbl[[jn]],
+          0
+        )
+      }
+      neg_cols <- lapply(seq_along(ord_pops), function(i) {
+        -prof_order_tbl[[paste0("sort__", i)]]
+      })
+      perm <- do.call(
+        order,
+        append(neg_cols, list(prof_order_tbl$base_idx))
+      )
+      prof_order <- prof_order_tbl$profileLabel[perm]
+    } else {
+      prof_order <- prof_order_base
+    }
+
+    cm_adm <- continental_meta()
+    pop_order <- cm_adm$ordered_names
     in_data <- unique(as.character(props$populationDefinition))
     in_data <- in_data[!is.na(in_data)]
     ordered_acr <- intersect(pop_order, in_data)
     rest <- sort(setdiff(in_data, pop_order))
     pop_levels <- c(ordered_acr, rest)
+
+    labs_adm <- cm_adm$label_by_name
+    fill_lab_vec <- vapply(
+      pop_levels,
+      function(nm) {
+        hit <- labs_adm[nm]
+        if (
+          length(hit) != 1L ||
+            is.na(hit) ||
+            !nzchar(as.character(hit))
+        ) {
+          nm
+        } else {
+          unname(hit)
+        }
+      },
+      character(1),
+      USE.NAMES = FALSE
+    )
 
     props <- props %>%
       dplyr::mutate(
@@ -855,12 +1169,8 @@ server <- function(input, output, session){
         superPop = .data$populationDefinition
       )
 
-    color_blind_black8 <- c(
-      "#E69F00", "#CC79A7", "#009E73",
-      "#0072B9", "#56B4E0", "#C0C0C0"
-    )
     fill_vals <- stats::setNames(
-      rep(color_blind_black8, length.out = length(pop_levels)),
+      admixture_fill_palette(length(pop_levels)),
       pop_levels
     )
 
@@ -878,6 +1188,7 @@ server <- function(input, output, session){
       ggplot2::scale_y_continuous(expand = c(0, 0)) +
       ggplot2::scale_fill_manual(
         breaks = pop_levels,
+        labels = fill_lab_vec,
         values = fill_vals
       )
 
@@ -915,6 +1226,7 @@ server <- function(input, output, session){
       ggplot2::theme(legend.position = "none") +
       ggplot2::scale_fill_manual(
         breaks = pop_levels,
+        labels = fill_lab_vec,
         values = fill_vals
       )
 

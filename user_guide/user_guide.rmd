@@ -4,12 +4,12 @@ date: "Feb 20 2026"
 ---
 
 ## Introduction
-This application is designed to interactively visualize...  
+This application is designed to interactively visualize genetic ancestry inferred from human molecular data other than whole-genome or whole-exome sequences of cancer-free DNA. Some examples of data it can handle includes targeted gene panels, RNA, whole genomes and whole exomes that can all include cancer-derived nucleic acids.  
 Source code and additional information for this application are available via the [Inferred Ancestry Dashboard GitHub repository](https://github.com)  
 <br>
 
 ## Application usage
-The application has two main inputs: a map and a table. To build plots for any individual sample, click on your desired sample in either the map or the table.  
+The application has three main features for analyzing inferred ancestry from cancer-derived molecular data: a map, a data table, and a set of plots given the selected data.  To build plots for any individual sample, click on your desired sample in either the map or the table.  [ADD IMAGES]
 
 The map and table inputs are responsive to eachother. When you click a site on the map, the table will automatically filter to samples associated with that site.
 When you click on a row in the table, the map will automatically fly to that site location.  
